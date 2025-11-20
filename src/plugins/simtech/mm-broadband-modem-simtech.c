@@ -1292,6 +1292,229 @@ set_current_modes (MMIfaceModem        *self,
 }
 
 /*****************************************************************************/
+/* Set current bands (Modem interface) */
+
+static gboolean
+set_current_bands_finish (MMIfaceModem  *self,
+                          GAsyncResult  *res,
+                          GError       **error)
+{
+    return g_task_propagate_boolean (G_TASK (res), error);
+}
+
+static void
+cnbp_mask_set_bit (GByteArray *mask,
+                   guint       bit_position)
+{
+    guint byte_pos;
+
+    byte_pos = bit_position / 8;
+    if (mask->len <= byte_pos)
+        g_byte_array_set_size (mask, byte_pos + 1);
+
+    mask->data[byte_pos] |= (guint8) (1u << (bit_position % 8));
+}
+
+static gchar *
+cnbp_mask_to_hex (GByteArray *mask,
+                  gsize       min_bytes)
+{
+    GString *hex;
+    guint    i;
+    gsize    used_bytes;
+
+    used_bytes = MAX (mask->len, min_bytes);
+
+    if (mask->len < used_bytes)
+        g_byte_array_set_size (mask, used_bytes);
+
+    /* Trim any trailing zeroes but never below the minimum requested bytes */
+    while (used_bytes > min_bytes && mask->data[used_bytes - 1] == 0)
+        used_bytes--;
+
+    hex = g_string_sized_new (used_bytes * 2);
+    for (i = used_bytes; i > 0; i--)
+        g_string_append_printf (hex, "%02X", mask->data[i - 1]);
+
+    return g_string_free (hex, FALSE);
+}
+
+static gboolean
+convert_band_to_cnbp_masks (MMModemBand  band,
+                            GByteArray  *mode_mask,
+                            GByteArray  *lte_mask,
+                            GByteArray  *tds_mask,
+                            GError     **error)
+{
+    const gchar *band_str;
+
+    if (band == MM_MODEM_BAND_ANY)
+        return TRUE;
+
+    switch (band) {
+    case MM_MODEM_BAND_G850:
+        cnbp_mask_set_bit (mode_mask, 0);
+        return TRUE;
+    case MM_MODEM_BAND_G900:
+        cnbp_mask_set_bit (mode_mask, 1);
+        return TRUE;
+    case MM_MODEM_BAND_G1800:
+        cnbp_mask_set_bit (mode_mask, 2);
+        return TRUE;
+    case MM_MODEM_BAND_G1900:
+        cnbp_mask_set_bit (mode_mask, 3);
+        return TRUE;
+    case MM_MODEM_BAND_UTRAN_1:
+        cnbp_mask_set_bit (mode_mask, 4);
+        return TRUE;
+    case MM_MODEM_BAND_UTRAN_2:
+        cnbp_mask_set_bit (mode_mask, 5);
+        return TRUE;
+    case MM_MODEM_BAND_UTRAN_3:
+        cnbp_mask_set_bit (mode_mask, 6);
+        return TRUE;
+    case MM_MODEM_BAND_UTRAN_4:
+        cnbp_mask_set_bit (mode_mask, 7);
+        return TRUE;
+    case MM_MODEM_BAND_UTRAN_5:
+        cnbp_mask_set_bit (mode_mask, 8);
+        return TRUE;
+    case MM_MODEM_BAND_UTRAN_6:
+        cnbp_mask_set_bit (mode_mask, 9);
+        return TRUE;
+    case MM_MODEM_BAND_UTRAN_8:
+        cnbp_mask_set_bit (mode_mask, 10);
+        return TRUE;
+    case MM_MODEM_BAND_UTRAN_9:
+        cnbp_mask_set_bit (mode_mask, 11);
+        return TRUE;
+    case MM_MODEM_BAND_UTRAN_19:
+        cnbp_mask_set_bit (mode_mask, 12);
+        return TRUE;
+    case MM_MODEM_BAND_UTRAN_34:
+    case MM_MODEM_BAND_UTRAN_35:
+    case MM_MODEM_BAND_UTRAN_36:
+    case MM_MODEM_BAND_UTRAN_37:
+    case MM_MODEM_BAND_UTRAN_38:
+    case MM_MODEM_BAND_UTRAN_39:
+        cnbp_mask_set_bit (tds_mask, band - MM_MODEM_BAND_UTRAN_34);
+        return TRUE;
+    default:
+        break;
+    }
+
+    band_str = mm_modem_band_get_string (band);
+
+    if (g_str_has_prefix (band_str, "EUTRAN_")) {
+        guint64 band_num;
+
+        band_num = g_ascii_strtoull (&band_str[7], NULL, 10);
+        if (band_num > 0 && band_num <= 256) {
+            cnbp_mask_set_bit (lte_mask, band_num - 1);
+            return TRUE;
+        }
+    }
+
+    g_set_error (error,
+                 MM_CORE_ERROR,
+                 MM_CORE_ERROR_UNSUPPORTED,
+                 "Band unsupported by this plugin: %s",
+                 band_str);
+    return FALSE;
+}
+
+static void
+cnbp_set_ready (MMBaseModem  *self,
+                GAsyncResult *res,
+                GTask        *task)
+{
+    GError *error = NULL;
+
+    if (!mm_base_modem_at_command_finish (self, res, &error)) {
+        g_task_return_error (task, error);
+        g_object_unref (task);
+        return;
+    }
+
+    g_task_return_boolean (task, TRUE);
+    g_object_unref (task);
+}
+
+static void
+set_current_bands (MMIfaceModem        *self,
+                   GArray              *bands_array,
+                   GAsyncReadyCallback  callback,
+                   gpointer             user_data)
+{
+    GByteArray *mode_mask;
+    GByteArray *lte_mask;
+    GByteArray *tds_mask;
+    guint     i;
+    GTask    *task;
+    gchar    *command;
+    gchar    *mode_hex;
+    gchar    *lte_hex;
+    gchar    *tds_hex;
+
+    task = g_task_new (self, NULL, callback, user_data);
+
+    mode_mask = g_byte_array_sized_new (8);
+    lte_mask = g_byte_array_sized_new (24);
+    tds_mask = g_byte_array_sized_new (8);
+
+    if (!bands_array || !bands_array->len) {
+        g_task_return_new_error (task,
+                                 MM_CORE_ERROR,
+                                 MM_CORE_ERROR_INVALID_ARGS,
+                                 "Empty band list not allowed");
+        g_object_unref (task);
+        return;
+    }
+
+    for (i = 0; i < bands_array->len; i++) {
+        MMModemBand band;
+
+        GError     *error = NULL;
+
+        band = g_array_index (bands_array, MMModemBand, i);
+        if (!convert_band_to_cnbp_masks (band, mode_mask, lte_mask, tds_mask, &error)) {
+            g_task_return_error (task, error);
+            g_byte_array_unref (mode_mask);
+            g_byte_array_unref (lte_mask);
+            g_byte_array_unref (tds_mask);
+            g_object_unref (task);
+            return;
+        }
+    }
+
+    /* Automatic selection */
+    if (bands_array->len == 1 && g_array_index (bands_array, MMModemBand, 0) == MM_MODEM_BAND_ANY) {
+        g_byte_array_set_size (mode_mask, 0);
+        g_byte_array_set_size (lte_mask, 0);
+        g_byte_array_set_size (tds_mask, 0);
+    }
+
+    mode_hex = cnbp_mask_to_hex (mode_mask, 8);
+    lte_hex  = cnbp_mask_to_hex (lte_mask, 24);
+    tds_hex  = cnbp_mask_to_hex (tds_mask, 8);
+
+    command = g_strdup_printf ("+CNBP=0x%s,0x%s,0x%s", mode_hex, lte_hex, tds_hex);
+    mm_base_modem_at_command (MM_BASE_MODEM (self),
+                              command,
+                              10,
+                              FALSE,
+                              (GAsyncReadyCallback)cnbp_set_ready,
+                              task);
+    g_free (command);
+    g_free (mode_hex);
+    g_free (lte_hex);
+    g_free (tds_hex);
+    g_byte_array_unref (mode_mask);
+    g_byte_array_unref (lte_mask);
+    g_byte_array_unref (tds_mask);
+}
+
+/*****************************************************************************/
 /* Setup ports (Broadband modem class) */
 
 static void
@@ -1418,6 +1641,8 @@ iface_modem_init (MMIfaceModemInterface *iface)
     iface->load_current_modes_finish = load_current_modes_finish;
     iface->set_current_modes = set_current_modes;
     iface->set_current_modes_finish = set_current_modes_finish;
+    iface->set_current_bands = set_current_bands;
+    iface->set_current_bands_finish = set_current_bands_finish;
     iface->reset = reset;
     iface->reset_finish = reset_finish;
     iface->load_unlock_required = load_unlock_required;
